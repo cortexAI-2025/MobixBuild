@@ -354,7 +354,7 @@ fun MobixBuildApp() {
                         Screen.Building -> Triple("●", "Building…", MBlue)
                         Screen.Success  -> Triple("●", "Success",   Success)
                         Screen.Failed   -> Triple("●", "Failed",    Danger)
-                        else -> Triple("●", "", TextMuted)
+                        Screen.Idle     -> Triple("●", "",          TextMuted)
                     }
                     Text(dot, color = dotColor, fontSize = 10.sp)
                     Text(label, color = dotColor, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
