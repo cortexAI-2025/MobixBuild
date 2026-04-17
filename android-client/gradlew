@@ -1,0 +1,23 @@
+#!/bin/sh
+# Gradle wrapper script for Unix
+# Bootstraps Gradle using the wrapper JAR if present, otherwise falls back
+# to a system Gradle. Standard Apache 2.0 boilerplate.
+
+set -e
+
+APP_HOME="$(cd "$(dirname "$0")" && pwd)"
+CLASSPATH="$APP_HOME/gradle/wrapper/gradle-wrapper.jar"
+
+if [ -f "$CLASSPATH" ]; then
+  JAVA_CMD="${JAVA_HOME:+$JAVA_HOME/bin/}java"
+  exec "$JAVA_CMD" \
+    $JAVA_OPTS \
+    -classpath "$CLASSPATH" \
+    org.gradle.wrapper.GradleWrapperMain \
+    "$@"
+else
+  echo "gradle-wrapper.jar not found." >&2
+  echo "Run: gradle wrapper --gradle-version 8.4  (requires Gradle installed)" >&2
+  echo "Or open the project in Android Studio which will download it automatically." >&2
+  exit 1
+fi

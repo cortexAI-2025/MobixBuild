@@ -11,6 +11,15 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// ─── CORS (allow web frontend from any origin) ────────────────────────────────
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 const BUILDS_DIR = process.env.BUILDS_DIR || path.join(__dirname, '..', 'builds');
 const SCRIPTS_DIR = process.env.SCRIPTS_DIR || path.join(__dirname, '..', 'scripts');
 const UPLOADS_DIR = process.env.UPLOADS_DIR || '/tmp/mobixbuild-uploads';
@@ -20,20 +29,28 @@ fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 
 // ─── In-memory state ──────────────────────────────────────────────────────────
 
-/** @type {Map<string, BuildRecord>} */
+/** @type {Map<string, object>} */
 const builds = new Map();
 /** @type {string[]} */
 const queue = [];
 let running = false;
 
-// ─── File upload (keystore + optional zip archive) ────────────────────────────
+// SSE clients: buildId -> Set of response objects
+/** @type {Map<string, Set<import('express').Response>>} */
+const sseClients = new Map();
+
+// ─── File upload ──────────────────────────────────────────────────────────────
 
 const upload = multer({
   dest: UPLOADS_DIR,
-  limits: { fileSize: 200 * 1024 * 1024 }, // 200 MB
+  limits: { fileSize: 200 * 1024 * 1024 },
 });
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function sseWrite(res, event, data) {
+  try { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); } catch (_) {}
+}
 
 function appendLog(id, line) {
   const build = builds.get(id);
@@ -42,13 +59,33 @@ function appendLog(id, line) {
   try {
     fs.appendFileSync(path.join(BUILDS_DIR, id, 'build.log'), line + '\n');
   } catch (_) {}
+
+  // Broadcast to SSE subscribers
+  const clients = sseClients.get(id);
+  if (clients && clients.size > 0) {
+    clients.forEach((res) => sseWrite(res, 'log', { line }));
+  }
+}
+
+function broadcastStatus(id, status) {
+  const clients = sseClients.get(id);
+  if (!clients || clients.size === 0) return;
+  clients.forEach((res) => {
+    sseWrite(res, 'status', { status });
+    if (status === 'success' || status === 'failed') {
+      sseWrite(res, 'done', { status });
+      try { res.end(); } catch (_) {}
+    }
+  });
+  if (status === 'success' || status === 'failed') {
+    sseClients.delete(id);
+  }
 }
 
 function findOutputFile(buildDir, mode) {
   const src = path.join(buildDir, 'source');
   const ext = mode === 'store' ? '.aab' : '.apk';
 
-  // Well-known output paths (fastest check)
   const candidates =
     mode === 'store'
       ? [
@@ -70,8 +107,6 @@ function findOutputFile(buildDir, mode) {
   for (const c of candidates) {
     if (fs.existsSync(c)) return c;
   }
-
-  // Fallback: recursive search under source/
   return walkForExt(src, ext);
 }
 
@@ -104,6 +139,8 @@ function processQueue() {
   build.status = 'running';
   build.startedAt = new Date().toISOString();
 
+  broadcastStatus(id, 'running');
+
   const buildDir = path.join(BUILDS_DIR, id);
   const scriptPath = path.join(SCRIPTS_DIR, 'build.sh');
 
@@ -111,10 +148,8 @@ function processQueue() {
   appendLog(id, `[MOBIXBUILD] mode=${build.mode}  repo=${build.repoUrl || '(uploaded archive)'}`);
 
   const args = [
-    id,
-    buildDir,
-    build.mode,
-    build.repoUrl   || '',
+    id, buildDir, build.mode,
+    build.repoUrl      || '',
     build.archivePath  || '',
     build.keystorePath || '',
     build.keystorePass || '',
@@ -147,17 +182,13 @@ function processQueue() {
       appendLog(id, `[MOBIXBUILD] Build failed (exit ${code})`);
     }
 
+    broadcastStatus(id, build.status);
     processQueue();
   });
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
-/**
- * POST /build
- * Body (JSON):  { repoUrl, mode, keystorePass, keyAlias, keyPass }
- * Body (form):  same fields + optional files: archive, keystore
- */
 app.post(
   '/build',
   upload.fields([
@@ -168,11 +199,11 @@ app.post(
     const body = req.body || {};
     const files = req.files || {};
 
-    const repoUrl    = body.repoUrl    || null;
-    const mode       = body.mode       || 'quick';
+    const repoUrl      = body.repoUrl      || null;
+    const mode         = body.mode         || 'quick';
     const keystorePass = body.keystorePass || '';
-    const keyAlias   = body.keyAlias   || 'release';
-    const keyPass    = body.keyPass    || '';
+    const keyAlias     = body.keyAlias     || 'release';
+    const keyPass      = body.keyPass      || '';
 
     const archiveFile  = files.archive  && files.archive[0];
     const keystoreFile = files.keystore && files.keystore[0];
@@ -192,78 +223,80 @@ app.post(
     fs.writeFileSync(path.join(buildDir, 'build.log'), '');
 
     builds.set(id, {
-      id,
-      status: 'queued',
-      mode,
-      repoUrl,
+      id, status: 'queued', mode, repoUrl,
       archivePath:  archiveFile  ? archiveFile.path  : null,
       keystorePath: keystoreFile ? keystoreFile.path : null,
-      keystorePass,
-      keyAlias,
-      keyPass,
+      keystorePass, keyAlias, keyPass,
       logs: [],
-      createdAt:   new Date().toISOString(),
-      startedAt:   null,
-      finishedAt:  null,
-      outputFile:  null,
+      createdAt: new Date().toISOString(),
+      startedAt: null, finishedAt: null, outputFile: null,
     });
 
     queue.push(id);
     setImmediate(processQueue);
-
     res.status(202).json({ id, status: 'queued' });
   }
 );
 
-/**
- * GET /build/:id/status
- */
 app.get('/build/:id/status', (req, res) => {
   const build = builds.get(req.params.id);
   if (!build) return res.status(404).json({ error: 'Build not found' });
-
   res.json({
-    id:          build.id,
-    status:      build.status,
-    mode:        build.mode,
-    createdAt:   build.createdAt,
-    startedAt:   build.startedAt,
-    finishedAt:  build.finishedAt,
-    logs:        build.logs,
+    id: build.id, status: build.status, mode: build.mode,
+    createdAt: build.createdAt, startedAt: build.startedAt,
+    finishedAt: build.finishedAt, logs: build.logs,
   });
 });
 
-/**
- * GET /build/:id/download
- */
+// SSE live log stream
+app.get('/build/:id/logs/stream', (req, res) => {
+  const build = builds.get(req.params.id);
+  if (!build) return res.status(404).end();
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no'); // disable nginx buffering
+  res.flushHeaders();
+
+  // Replay existing logs
+  build.logs.forEach((line) => sseWrite(res, 'log', { line }));
+  sseWrite(res, 'status', { status: build.status });
+
+  // If already terminal, close immediately
+  if (build.status === 'success' || build.status === 'failed') {
+    sseWrite(res, 'done', { status: build.status });
+    return res.end();
+  }
+
+  // Register client
+  if (!sseClients.has(req.params.id)) sseClients.set(req.params.id, new Set());
+  sseClients.get(req.params.id).add(res);
+
+  req.on('close', () => {
+    const clients = sseClients.get(req.params.id);
+    if (clients) clients.delete(res);
+  });
+});
+
 app.get('/build/:id/download', (req, res) => {
   const build = builds.get(req.params.id);
   if (!build) return res.status(404).json({ error: 'Build not found' });
-
   if (build.status !== 'success') {
     return res.status(400).json({ error: `Build status is '${build.status}', not 'success'` });
   }
-
-  // Resolve output file (cached or re-scan)
   const outputFile =
-    build.outputFile ||
-    findOutputFile(path.join(BUILDS_DIR, build.id), build.mode);
-
+    build.outputFile || findOutputFile(path.join(BUILDS_DIR, build.id), build.mode);
   if (!outputFile || !fs.existsSync(outputFile)) {
     return res.status(404).json({ error: 'Output artifact not found on disk' });
   }
-
-  build.outputFile = outputFile; // cache
+  build.outputFile = outputFile;
   res.download(outputFile, path.basename(outputFile));
 });
-
-// ─── Health check ─────────────────────────────────────────────────────────────
 
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', queued: queue.length, running });
 });
-
-// ─── Start ────────────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {

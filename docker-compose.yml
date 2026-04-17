@@ -1,8 +1,19 @@
 version: '3.8'
 
+# MobixBuild – all services
+#
+# Usage:
+#   docker compose up --build          # start everything
+#   docker compose up api              # backend only
+#   docker compose up api web          # backend + web frontend
+
 services:
+
+  # ── Build API (Node.js) ─────────────────────────────────────────────────────
   api:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     ports:
       - "3000:3000"
     volumes:
@@ -17,6 +28,20 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+
+  # ── Web frontend (Next.js) ──────────────────────────────────────────────────
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile.web
+    ports:
+      - "8080:8080"
+    environment:
+      NEXT_PUBLIC_API_URL: "http://localhost:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   builds:
