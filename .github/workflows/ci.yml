@@ -71,21 +71,20 @@ jobs:
       - name: Build with Gradle
         working-directory: android-client
         run: |
-          # --stacktrace : Donne plus de détails sur l'erreur
-          # --info       : Affiche tout le processus, pas seulement les erreurs
-          # --no-daemon  : Sur GitHub Actions le daemon Gradle plante souvent,
-          #                le désactiver rend le build beaucoup plus stable
-          ./gradlew assembleDebug --stacktrace --info --no-daemon \
+          ./gradlew assembleDebug --stacktrace --no-daemon \
             -Dorg.gradle.jvmargs="-Xmx2g -XX:MaxMetaspaceSize=512m" \
-            --max-workers=1
+            --max-workers=1 2>&1 | tee /tmp/gradle-build.log
+          exit ${PIPESTATUS[0]}
 
-      - name: Show build logs on failure
-        working-directory: android-client
-        # Affiche les logs de build (s'ils existent) pour voir ce qui s'est passé
+      - name: Extract real error on failure
         if: failure()
         run: |
-          find app/build/outputs -name "*.log" 2>/dev/null | xargs cat 2>/dev/null || true
-          find . -path "*/build/tmp/*" -name "*.log" 2>/dev/null | xargs cat 2>/dev/null || true
+          echo "════════ CAUSE RÉELLE ════════"
+          grep -A 10 "Caused by:" /tmp/gradle-build.log | head -60 || true
+          echo "════════ WHAT WENT WRONG ════════"
+          grep -A 10 "What went wrong" /tmp/gradle-build.log | head -40 || true
+          echo "════════ AAPT2 / ERREURS RESSOURCES ════════"
+          grep -iE "(error:|AAPT|resource.*not found|failed)" /tmp/gradle-build.log | head -30 || true
 
       - name: Upload debug APK
         uses: actions/upload-artifact@v4

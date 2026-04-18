@@ -4,8 +4,9 @@ plugins {
 }
 
 android {
-    namespace   = "com.mobixbuild.client"
-    compileSdk  = 34
+    namespace      = "com.mobixbuild.client"
+    compileSdk     = 34
+    buildToolsVersion = "34.0.0"
 
     defaultConfig {
         applicationId   = "com.mobixbuild.client"
@@ -42,6 +43,10 @@ android {
 
     kotlinOptions {
         jvmTarget = "17"
+    }
+
+    aaptOptions {
+        cruncherEnabled = false
     }
 }
 
