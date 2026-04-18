@@ -2,11 +2,11 @@ name: Build Android APK
 
 on:
   push:
-    branches: [ "main" ] # Déclenche le build quand vous poussez sur la branche 'main'
+    branches: [ "main", "claude/android-saas-build-backend-b4p0Z" ]
 
 jobs:
   build:
-    runs-on: ubuntu-latest # Utilise un serveur Linux
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
@@ -18,9 +18,13 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
+      - name: Make gradlew executable
+        working-directory: android-client
+        run: chmod +x gradlew
+
       - name: Clean Gradle
         working-directory: android-client
-        run: ./gradlew clean
+        run: ./gradlew clean --no-daemon
 
       - name: Build with Gradle
         working-directory: android-client
