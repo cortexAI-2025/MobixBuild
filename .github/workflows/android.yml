@@ -27,23 +27,34 @@ jobs:
           build-root-directory: android-client
           cache-read-only: false
 
-      - name: Make gradlew executable
+      - name: Regenerate wrapper JAR
         working-directory: android-client
-        run: chmod +x gradlew
+        run: |
+          gradle wrapper --gradle-version 8.4 --no-validate-url
+          chmod +x gradlew
 
       - name: Clean Gradle cache
         working-directory: android-client
-        run: ./gradlew clean --no-daemon
+        run: gradle clean --no-daemon
 
       - name: Build debug APK
         working-directory: android-client
         run: |
-          ./gradlew assembleDebug \
+          gradle assembleDebug \
             --no-daemon \
             --stacktrace \
-            --info \
             --max-workers=1 \
-            -Dorg.gradle.jvmargs="-Xmx2g -XX:MaxMetaspaceSize=512m"
+            -Dorg.gradle.jvmargs="-Xmx2g -XX:MaxMetaspaceSize=512m" \
+            2>&1 | tee /tmp/gradle-build.log
+          exit ${PIPESTATUS[0]}
+
+      - name: Extract real error on failure
+        if: failure()
+        run: |
+          echo "════════ CAUSE RÉELLE ════════"
+          grep -A 10 "Caused by:" /tmp/gradle-build.log | head -60 || true
+          echo "════════ WHAT WENT WRONG ════════"
+          grep -A 10 "What went wrong" /tmp/gradle-build.log | head -40 || true
 
       - name: Upload APK
         uses: actions/upload-artifact@v4

@@ -60,18 +60,22 @@ jobs:
         uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: '8.4'
-          build-root-directory: android-client   # ← key fix
+          build-root-directory: android-client
           cache-read-only: false
 
-      - name: Make gradlew executable
+      # Régénère le wrapper JAR depuis Gradle 8.4 installé par setup-gradle.
+      # validateDistributionUrl=false évite le téléchargement réseau.
+      - name: Regenerate wrapper JAR
         working-directory: android-client
-        run: chmod +x gradlew
+        run: |
+          gradle wrapper --gradle-version 8.4 --no-validate-url
+          chmod +x gradlew
 
       # ── Quick (debug) APK ─────────────────────────────────────────────────────
       - name: Build with Gradle
         working-directory: android-client
         run: |
-          ./gradlew assembleDebug --stacktrace --no-daemon \
+          gradle assembleDebug --stacktrace --no-daemon \
             -Dorg.gradle.jvmargs="-Xmx2g -XX:MaxMetaspaceSize=512m" \
             --max-workers=1 2>&1 | tee /tmp/gradle-build.log
           exit ${PIPESTATUS[0]}
