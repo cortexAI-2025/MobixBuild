@@ -19,10 +19,25 @@ jobs:
           java-version: '17'
 
       - name: Build with Gradle
-        run: ./gradlew assembleDebug # La commande pour créer l'APK
+        working-directory: android-client
+        # On force l'affichage complet et on désactive le daemon pour la stabilité
+        run: ./gradlew assembleDebug --stacktrace --no-daemon --info
+
+      - name: Show readable errors on failure
+        working-directory: android-client
+        if: failure()
+        run: |
+          echo "════════════════════════════════════════"
+          echo "           ERREURS DE COMPILATION"
+          echo "════════════════════════════════════════"
+          # Extrait uniquement les lignes d'erreur/warning du log Gradle
+          ./gradlew assembleDebug --no-daemon 2>&1 \
+            | grep -E "^(error:|warning:|FAILURE|FAILED|Exception|Caused by|> Task|What went wrong)" \
+            || true
+          echo "════════════════════════════════════════"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: app-debug
-          path: app/build/outputs/apk/debug/app-debug.apk # Où trouver l'APK généré
+          path: android-client/app/build/outputs/apk/debug/app-debug.apk
