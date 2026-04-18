@@ -71,13 +71,18 @@ jobs:
           chmod +x gradlew
 
       # ── Quick (debug) APK ─────────────────────────────────────────────────────
-      - name: Build debug APK
+      - name: Build with Gradle
         working-directory: android-client
+        # --info pour tout voir, --no-daemon pour éviter les crashs de mémoire du démon
+        run: ./gradlew assembleDebug --info --stacktrace --no-daemon
+
+      - name: Show build logs on failure
+        working-directory: android-client
+        # Affiche les logs de build (s'ils existent) pour voir ce qui s'est passé
+        if: failure()
         run: |
-          ./gradlew assembleDebug \
-            --no-daemon \
-            --stacktrace \
-            -Dorg.gradle.jvmargs="-Xmx2g"
+          find app/build/outputs -name "*.log" 2>/dev/null | xargs cat 2>/dev/null || true
+          find . -path "*/build/tmp/*" -name "*.log" 2>/dev/null | xargs cat 2>/dev/null || true
 
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
