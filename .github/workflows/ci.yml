@@ -63,12 +63,9 @@ jobs:
           build-root-directory: android-client   # ← key fix
           cache-read-only: false
 
-      # gradle-wrapper.jar is a binary; regenerate it from the installed Gradle.
-      - name: Regenerate Gradle wrapper JAR
+      - name: Make gradlew executable
         working-directory: android-client
-        run: |
-          gradle wrapper --gradle-version 8.4
-          chmod +x gradlew
+        run: chmod +x gradlew
 
       # ── Quick (debug) APK ─────────────────────────────────────────────────────
       - name: Build with Gradle

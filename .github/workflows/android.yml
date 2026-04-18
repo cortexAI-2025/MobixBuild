@@ -27,13 +27,9 @@ jobs:
           build-root-directory: android-client
           cache-read-only: false
 
-      # Régénère le gradle-wrapper.jar depuis le Gradle installé ci-dessus
-      # (le jar binaire committé peut être d'une version incompatible)
-      - name: Regenerate Gradle wrapper JAR
+      - name: Make gradlew executable
         working-directory: android-client
-        run: |
-          gradle wrapper --gradle-version 8.4
-          chmod +x gradlew
+        run: chmod +x gradlew
 
       - name: Clean Gradle cache
         working-directory: android-client
