@@ -1,39 +1,39 @@
-name: Build Andrpud
+name: CI
 
 on:
   push:
-    branches: [ "main" ] # Déclenche le build quand vous poussez sur la branche 'main'
+    branches: ['**']
+  pull_request:
 
 jobs:
-  build:
-    runs-on: ubuntu-latest # Utilise un serveur Linux
 
+  # ── Job 1: Validate scripts & server ─────────────────────────────────────────
+  validate:
+    name: Validate pipeline scripts
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '17'
+      - name: Syntax check – build.sh
+        run: |
+          bash -n scripts/build.sh
+          echo "✓ scripts/build.sh"
 
-      - name: Clean Gradle
-        working-directory: android-client
-        run: ./gradlew clean
+      - name: Syntax check – server/index.js
+        run: |
+          node --check server/index.js
+          echo "✓ server/index.js"
 
-      - name: Build with Gradle
-        working-directory: android-client
-        # On utilise --no-daemon pour éviter les crashs mémoire
-        # On ajoute --stacktrace pour voir l'erreur réelle en cas de crash
-        # On ajoute --info pour avoir des logs détaillés
-        run: ./gradlew assembleDebug --no-daemon --stacktrace --info
-
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-apk
-          path: android-client/app/build/outputs/apk/debug/app-debug.apk
+      - name: Verify required files exist
+        run: |
+          set -e
+          declare -a required=(
+            "scripts/build.sh"
+            "server/index.js"
+            "server/package.json"
+            "Dockerfile"
+            "docker-compose.yml"
+            "android-client/settings.gradle.kts"
             "android-client/app/build.gradle.kts"
             "android-client/gradle/wrapper/gradle-wrapper.properties"
           )
