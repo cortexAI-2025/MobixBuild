@@ -73,8 +73,12 @@ jobs:
       # ── Quick (debug) APK ─────────────────────────────────────────────────────
       - name: Build with Gradle
         working-directory: android-client
-        # --info pour tout voir, --no-daemon pour éviter les crashs de mémoire du démon
-        run: ./gradlew assembleDebug --info --stacktrace --no-daemon
+        run: |
+          # --stacktrace : Donne plus de détails sur l'erreur
+          # --info       : Affiche tout le processus, pas seulement les erreurs
+          # --no-daemon  : Sur GitHub Actions le daemon Gradle plante souvent,
+          #                le désactiver rend le build beaucoup plus stable
+          ./gradlew assembleDebug --stacktrace --info --no-daemon
 
       - name: Show build logs on failure
         working-directory: android-client
