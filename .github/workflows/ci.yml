@@ -59,7 +59,7 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v3
         with:
-          gradle-version: '8.4'
+          gradle-version: '8.6'
           build-root-directory: android-client
           cache-read-only: false
 
@@ -68,7 +68,7 @@ jobs:
       - name: Regenerate wrapper JAR
         working-directory: android-client
         run: |
-          gradle wrapper --gradle-version 8.4 --no-validate-url
+          gradle wrapper --gradle-version 8.6 --no-validate-url
           chmod +x gradlew
 
       # ── Quick (debug) APK ─────────────────────────────────────────────────────
