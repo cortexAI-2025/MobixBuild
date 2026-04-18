@@ -78,7 +78,9 @@ jobs:
           # --info       : Affiche tout le processus, pas seulement les erreurs
           # --no-daemon  : Sur GitHub Actions le daemon Gradle plante souvent,
           #                le désactiver rend le build beaucoup plus stable
-          ./gradlew assembleDebug --stacktrace --info --no-daemon
+          ./gradlew assembleDebug --stacktrace --info --no-daemon \
+            -Dorg.gradle.jvmargs="-Xmx2g -XX:MaxMetaspaceSize=512m" \
+            --max-workers=1
 
       - name: Show build logs on failure
         working-directory: android-client
