@@ -12,29 +12,46 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Java
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Make gradlew executable
-        working-directory: android-client
-        run: chmod +x gradlew
+      # Installe Gradle 8.4 et pointe sur android-client/ pour trouver
+      # gradle-wrapper.properties (évite l'erreur "No file matched")
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.4'
+          build-root-directory: android-client
+          cache-read-only: false
 
-      - name: Clean Gradle
+      # Régénère le gradle-wrapper.jar depuis le Gradle installé ci-dessus
+      # (le jar binaire committé peut être d'une version incompatible)
+      - name: Regenerate Gradle wrapper JAR
+        working-directory: android-client
+        run: |
+          gradle wrapper --gradle-version 8.4
+          chmod +x gradlew
+
+      - name: Clean Gradle cache
         working-directory: android-client
         run: ./gradlew clean --no-daemon
 
-      - name: Build with Gradle
+      - name: Build debug APK
         working-directory: android-client
-        # On utilise --no-daemon pour éviter les crashs mémoire
-        # On ajoute --stacktrace pour voir l'erreur réelle en cas de crash
-        # On ajoute --info pour avoir des logs détaillés
-        run: ./gradlew assembleDebug --no-daemon --stacktrace --info
+        run: |
+          ./gradlew assembleDebug \
+            --no-daemon \
+            --stacktrace \
+            --info \
+            --max-workers=1 \
+            -Dorg.gradle.jvmargs="-Xmx2g -XX:MaxMetaspaceSize=512m"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: debug-apk
-          path: android-client/app/build/outputs/apk/debug/app-debug.apk
+          path: android-client/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
