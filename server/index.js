@@ -24,6 +24,9 @@ const BUILDS_DIR = process.env.BUILDS_DIR || path.join(__dirname, '..', 'builds'
 const SCRIPTS_DIR = process.env.SCRIPTS_DIR || path.join(__dirname, '..', 'scripts');
 const UPLOADS_DIR = process.env.UPLOADS_DIR || '/tmp/mobixbuild-uploads';
 
+const BUILD_TIMEOUT_MS = (parseInt(process.env.BUILD_TIMEOUT_MIN, 10) || 30) * 60 * 1000;
+const RETENTION_MS     = (parseInt(process.env.BUILD_RETENTION_HOURS, 10) || 24) * 3600 * 1000;
+
 fs.mkdirSync(BUILDS_DIR, { recursive: true });
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 
@@ -38,6 +41,55 @@ let running = false;
 // SSE clients: buildId -> Set of response objects
 /** @type {Map<string, Set<import('express').Response>>} */
 const sseClients = new Map();
+
+// ─── Persistence (survive restarts) ───────────────────────────────────────────
+
+const SECRET_FIELDS = ['keystorePass', 'keyPass'];
+
+function persistBuild(build) {
+  try {
+    const copy = { ...build, logs: undefined };
+    SECRET_FIELDS.forEach((k) => delete copy[k]);
+    fs.writeFileSync(path.join(BUILDS_DIR, build.id, 'meta.json'), JSON.stringify(copy));
+  } catch (_) {}
+}
+
+function loadPersistedBuilds() {
+  for (const id of fs.readdirSync(BUILDS_DIR)) {
+    const dir = path.join(BUILDS_DIR, id);
+    try {
+      const meta = JSON.parse(fs.readFileSync(path.join(dir, 'meta.json'), 'utf8'));
+      let logs = [];
+      try { logs = fs.readFileSync(path.join(dir, 'build.log'), 'utf8').split('\n').filter(Boolean); } catch (_) {}
+      // A build that was running/queued when the server died can never finish
+      if (meta.status === 'running' || meta.status === 'queued') {
+        meta.status = 'failed';
+        meta.finishedAt = new Date().toISOString();
+        logs.push('[MOBIXBUILD] Build interrupted by server restart');
+      }
+      builds.set(id, { ...meta, logs });
+    } catch (_) {}
+  }
+}
+
+function cleanupOldBuilds() {
+  const now = Date.now();
+  for (const [id, b] of builds) {
+    if (b.status === 'queued' || b.status === 'running') continue;
+    const finished = Date.parse(b.finishedAt || b.createdAt) || now;
+    if (now - finished < RETENTION_MS) continue;
+    builds.delete(id);
+    fs.rm(path.join(BUILDS_DIR, id), { recursive: true, force: true }, () => {});
+    if (b.archivePath)  fs.rm(b.archivePath,  { force: true }, () => {});
+    if (b.keystorePath) fs.rm(b.keystorePath, { force: true }, () => {});
+  }
+}
+
+// Only accept plain remote git URLs (blocks `--upload-pack=...`, file://, ext:: …)
+function isValidRepoUrl(u) {
+  return typeof u === 'string' && u.length < 500 &&
+    /^(https:\/\/|git@)[\w.@:\/~+-]+$/.test(u) && !u.includes('..');
+}
 
 // ─── File upload ──────────────────────────────────────────────────────────────
 
@@ -83,6 +135,12 @@ function broadcastStatus(id, status) {
 }
 
 function findOutputFile(buildDir, mode) {
+  // build.sh records the exact artifact it produced
+  try {
+    const recorded = fs.readFileSync(path.join(buildDir, 'output.path'), 'utf8').trim();
+    if (recorded && fs.existsSync(recorded)) return recorded;
+  } catch (_) {}
+
   const src = path.join(buildDir, 'source');
   const ext = mode === 'store' ? '.aab' : '.apk';
 
@@ -138,6 +196,7 @@ function processQueue() {
   running = true;
   build.status = 'running';
   build.startedAt = new Date().toISOString();
+  persistBuild(build);
 
   broadcastStatus(id, 'running');
 
@@ -160,7 +219,17 @@ function processQueue() {
   const proc = spawn('bash', [scriptPath, ...args], {
     cwd: buildDir,
     env: { ...process.env, BUILD_ID: id, BUILD_DIR: buildDir },
+    detached: true, // own process group so a timeout can kill gradle & children
   });
+
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    appendLog(id, `[MOBIXBUILD] Timeout after ${BUILD_TIMEOUT_MS / 60000} min — killing build`);
+    try { process.kill(-proc.pid, 'SIGKILL'); } catch (_) {}
+  }, BUILD_TIMEOUT_MS);
+
+  proc.on('error', (err) => appendLog(id, `[MOBIXBUILD] Cannot start build script: ${err.message}`));
 
   proc.stdout.on('data', (data) =>
     data.toString().split('\n').filter(Boolean).forEach((l) => appendLog(id, l))
@@ -170,18 +239,29 @@ function processQueue() {
   );
 
   proc.on('close', (code) => {
+    clearTimeout(timer);
     running = false;
     build.finishedAt = new Date().toISOString();
 
+    // Secrets are only needed during the build
+    if (build.keystorePath) fs.rm(build.keystorePath, { force: true }, () => {});
+    if (build.archivePath)  fs.rm(build.archivePath,  { force: true }, () => {});
+
     if (code === 0) {
-      build.status = 'success';
       build.outputFile = findOutputFile(buildDir, build.mode);
-      appendLog(id, `[MOBIXBUILD] Build succeeded → ${build.outputFile || 'output not located'}`);
+      if (build.outputFile) {
+        build.status = 'success';
+        appendLog(id, `[MOBIXBUILD] Build succeeded → ${path.basename(build.outputFile)}`);
+      } else {
+        build.status = 'failed';
+        appendLog(id, '[MOBIXBUILD] Build finished but no APK/AAB was produced');
+      }
     } else {
       build.status = 'failed';
-      appendLog(id, `[MOBIXBUILD] Build failed (exit ${code})`);
+      appendLog(id, `[MOBIXBUILD] Build failed (${timedOut ? 'timeout' : 'exit ' + code})`);
     }
 
+    persistBuild(build);
     broadcastStatus(id, build.status);
     processQueue();
   });
@@ -211,6 +291,9 @@ app.post(
     if (!repoUrl && !archiveFile) {
       return res.status(400).json({ error: 'Provide repoUrl or upload an archive file' });
     }
+    if (repoUrl && !isValidRepoUrl(repoUrl)) {
+      return res.status(400).json({ error: 'repoUrl must be an https:// or git@ repository URL' });
+    }
 
     const validModes = ['quick', 'production', 'store'];
     if (!validModes.includes(mode)) {
@@ -232,6 +315,7 @@ app.post(
       startedAt: null, finishedAt: null, outputFile: null,
     });
 
+    persistBuild(builds.get(id));
     queue.push(id);
     setImmediate(processQueue);
     res.status(202).json({ id, status: 'queued' });
@@ -294,8 +378,26 @@ app.get('/build/:id/download', (req, res) => {
   res.download(outputFile, path.basename(outputFile));
 });
 
+app.get('/builds', (_req, res) => {
+  const list = [...builds.values()]
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    .slice(0, 50)
+    .map(({ id, status, mode, repoUrl, createdAt, finishedAt }) =>
+      ({ id, status, mode, repoUrl, createdAt, finishedAt }));
+  res.json(list);
+});
+
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', queued: queue.length, running });
+  res.json({ status: 'ok', queued: queue.length, running, builds: builds.size });
+});
+
+loadPersistedBuilds();
+cleanupOldBuilds();
+setInterval(cleanupOldBuilds, 30 * 60 * 1000).unref();
+
+// Multer / route errors → JSON instead of an HTML stack trace
+app.use((err, _req, res, _next) => {
+  res.status(err.code === 'LIMIT_FILE_SIZE' ? 413 : 400).json({ error: err.message });
 });
 
 const PORT = process.env.PORT || 3000;

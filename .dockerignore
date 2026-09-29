@@ -1,0 +1,7 @@
+.git
+**/node_modules
+web/.next
+builds
+android-client/app/build
+android-client/.gradle
+*.log

@@ -49,7 +49,7 @@ mkdir -p "${SOURCE_DIR}"
 
 if [ -n "${REPO_URL}" ]; then
   log "Cloning: ${REPO_URL}"
-  git clone --depth=1 "${REPO_URL}" "${SOURCE_DIR}" 2>&1
+  GIT_TERMINAL_PROMPT=0 git clone --depth=1 -- "${REPO_URL}" "${SOURCE_DIR}" 2>&1
 elif [ -n "${ARCHIVE_PATH}" ] && [ -f "${ARCHIVE_PATH}" ]; then
   log "Extracting archive: ${ARCHIVE_PATH}"
   unzip -q "${ARCHIVE_PATH}" -d "${SOURCE_DIR}" 2>&1 || \
@@ -113,20 +113,34 @@ fi
 
 # ─── Locate Android project root ──────────────────────────────────────────────
 
+is_gradle_root() {
+  [ -f "$1/gradlew" ] || [ -f "$1/settings.gradle" ] || [ -f "$1/settings.gradle.kts" ]
+}
+
 ANDROID_DIR=""
-if [ -f "gradlew" ]; then
+if is_gradle_root "${SOURCE_DIR}"; then
   ANDROID_DIR="${SOURCE_DIR}"
-elif [ -d "android" ] && [ -f "android/gradlew" ]; then
-  ANDROID_DIR="${SOURCE_DIR}/android"
-elif [ -d "android" ] && [ -f "android/build.gradle" ]; then
+elif [ -d "${SOURCE_DIR}/android" ] && is_gradle_root "${SOURCE_DIR}/android"; then
   ANDROID_DIR="${SOURCE_DIR}/android"
 else
-  die "No Android project found (no gradlew or android/ directory)"
+  die "No Android project found (need gradlew or settings.gradle[.kts], at the root or in android/)"
 fi
 
 log "Android dir: ${ANDROID_DIR}"
 cd "${ANDROID_DIR}"
-chmod +x gradlew
+
+# Use the project's wrapper when it is complete; otherwise fall back to the
+# Gradle distribution baked into the image (wrapper jar is often not committed).
+if [ -f gradlew ] && [ -f gradle/wrapper/gradle-wrapper.jar ]; then
+  chmod +x gradlew
+  GRADLE_CMD="./gradlew"
+elif command -v gradle >/dev/null 2>&1; then
+  log "Gradle wrapper missing/incomplete – using system Gradle"
+  GRADLE_CMD="gradle"
+else
+  die "No usable Gradle: wrapper jar missing and no system gradle installed"
+fi
+log "Gradle command: ${GRADLE_CMD}"
 
 # Write local.properties so Gradle can find the SDK
 cat > local.properties <<EOF
@@ -170,6 +184,7 @@ GRADLE_FLAGS="--no-daemon --stacktrace --max-workers=1 -Dorg.gradle.jvmargs=-Xmx
 
 setup_keystore() {
   local ks_dest="${ANDROID_DIR}/app/release.keystore"
+  mkdir -p "$(dirname "${ks_dest}")"
 
   if [ -n "${KEYSTORE_PATH}" ] && [ -f "${KEYSTORE_PATH}" ]; then
     log "Using provided keystore"
@@ -223,43 +238,58 @@ sign_apk() {
 
 # ─── Gradle build ─────────────────────────────────────────────────────────────
 
+OUTPUT=""
+
 if [ "${MODE}" = "quick" ]; then
   log "--- MODE: quick (assembleDebug) ---"
   # shellcheck disable=SC2086
-  ./gradlew assembleDebug ${GRADLE_FLAGS} 2>&1
+  ${GRADLE_CMD} assembleDebug ${GRADLE_FLAGS} 2>&1
+  OUTPUT=$(find . -path "*/build/outputs/apk/debug/*.apk" -type f 2>/dev/null | head -1 || true)
   log "Debug APK built."
 
 elif [ "${MODE}" = "production" ]; then
   log "--- MODE: production (assembleRelease + sign) ---"
   setup_keystore
   # shellcheck disable=SC2086
-  ./gradlew assembleRelease ${GRADLE_FLAGS} \
+  ${GRADLE_CMD} assembleRelease ${GRADLE_FLAGS} \
     "-Pandroid.injected.signing.store.file=${ANDROID_DIR}/app/release.keystore" \
     "-Pandroid.injected.signing.store.password=${KEYSTORE_PASS}" \
     "-Pandroid.injected.signing.key.alias=${KEY_ALIAS}" \
     "-Pandroid.injected.signing.key.password=${KEY_PASS}" \
     2>&1
 
-  RELEASE_APK=$(find app/build/outputs/apk/release -name "*.apk" ! -name "*-signed*" 2>/dev/null | head -1 || true)
-  [ -n "${RELEASE_APK}" ] && sign_apk "${ANDROID_DIR}/${RELEASE_APK}" || log "Warning: release APK not found"
+  RELEASE_APK=$(find . -path "*/build/outputs/apk/release/*.apk" ! -name "*-signed*" ! -name "*-aligned*" -type f 2>/dev/null | head -1 || true)
+  if [ -n "${RELEASE_APK}" ]; then
+    sign_apk "${ANDROID_DIR}/${RELEASE_APK#./}"
+    OUTPUT=$(find . -path "*/build/outputs/apk/release/*-signed.apk" -type f 2>/dev/null | head -1 || true)
+    # apksigner unavailable/failed → ship the unsigned release APK rather than nothing
+    [ -n "${OUTPUT}" ] || OUTPUT="${RELEASE_APK}"
+  fi
 
 elif [ "${MODE}" = "store" ]; then
   log "--- MODE: store (bundleRelease) ---"
   setup_keystore
   # shellcheck disable=SC2086
-  ./gradlew bundleRelease ${GRADLE_FLAGS} \
+  ${GRADLE_CMD} bundleRelease ${GRADLE_FLAGS} \
     "-Pandroid.injected.signing.store.file=${ANDROID_DIR}/app/release.keystore" \
     "-Pandroid.injected.signing.store.password=${KEYSTORE_PASS}" \
     "-Pandroid.injected.signing.key.alias=${KEY_ALIAS}" \
     "-Pandroid.injected.signing.key.password=${KEY_PASS}" \
     2>&1
 
-  AAB=$(find app/build/outputs/bundle -name "*.aab" 2>/dev/null | head -1 || true)
-  [ -n "${AAB}" ] && log "AAB: ${ANDROID_DIR}/${AAB}" || log "Warning: .aab not found"
+  OUTPUT=$(find . -path "*/build/outputs/bundle/release/*.aab" -type f 2>/dev/null | head -1 || true)
 
 else
   die "Unknown mode '${MODE}'. Use: quick | production | store"
 fi
+
+# ─── Record the produced artifact for the API ─────────────────────────────────
+
+[ -n "${OUTPUT:-}" ] || die "Gradle finished but no artifact was found"
+OUTPUT_ABS="${ANDROID_DIR}/${OUTPUT#./}"
+[ -f "${OUTPUT_ABS}" ] || die "Artifact missing: ${OUTPUT_ABS}"
+echo "${OUTPUT_ABS}" > "${BUILD_DIR}/output.path"
+log "Artifact: ${OUTPUT_ABS} ($(du -h "${OUTPUT_ABS}" | cut -f1))"
 
 log "=========================================="
 log "  Build complete  id=${BUILD_ID}"

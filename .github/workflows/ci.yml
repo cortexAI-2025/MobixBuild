@@ -24,6 +24,17 @@ jobs:
           node --check server/index.js
           echo "✓ server/index.js"
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: End-to-end API test (fake Gradle project, all 3 modes)
+        run: |
+          (cd server && npm ci)
+          tests/e2e.sh
+
       - name: Verify required files exist
         run: |
           set -e
@@ -33,6 +44,9 @@ jobs:
             "server/package.json"
             "Dockerfile"
             "docker-compose.yml"
+            "tests/e2e.sh"
+            "server/package-lock.json"
+            "web/package-lock.json"
             "android-client/settings.gradle.kts"
             "android-client/app/build.gradle.kts"
             "android-client/gradle/wrapper/gradle-wrapper.properties"
@@ -155,6 +169,9 @@ jobs:
 
       - name: Build API image
         run: docker build --tag mobixbuild-api:ci .
+
+      - name: Build web image
+        run: docker build --file web/Dockerfile.web --tag mobixbuild-web:ci web
 
       - name: Smoke-test container
         run: |

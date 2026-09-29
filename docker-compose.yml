@@ -22,6 +22,8 @@ services:
       PORT: "3000"
       BUILDS_DIR: "/builds"
       SCRIPTS_DIR: "/scripts"
+      BUILD_TIMEOUT_MIN: "30"
+      BUILD_RETENTION_HOURS: "24"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
@@ -34,10 +36,12 @@ services:
     build:
       context: ./web
       dockerfile: Dockerfile.web
+      args:
+        # URL the BROWSER uses to reach the API (baked in at build time).
+        # Deploying remotely?  PUBLIC_API_URL=https://api.example.com docker compose up --build
+        NEXT_PUBLIC_API_URL: "${PUBLIC_API_URL:-http://localhost:3000}"
     ports:
       - "8080:8080"
-    environment:
-      NEXT_PUBLIC_API_URL: "http://localhost:3000"
     depends_on:
       api:
         condition: service_healthy

@@ -6,3 +6,5 @@ builds/
 .env.*
 *.keystore
 *.jks
+.next/
+next-env.d.ts

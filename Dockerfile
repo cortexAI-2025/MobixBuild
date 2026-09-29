@@ -24,6 +24,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       gnupg \
     && rm -rf /var/lib/apt/lists/*
 
+# ─── Gradle (fallback for projects that ship no gradle-wrapper.jar) ──────────
+ARG GRADLE_VERSION=8.6
+RUN wget -q "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" -O /tmp/gradle.zip \
+    && unzip -q /tmp/gradle.zip -d /opt \
+    && ln -s "/opt/gradle-${GRADLE_VERSION}/bin/gradle" /usr/local/bin/gradle \
+    && rm /tmp/gradle.zip
+
 # ─── Node.js 18 ───────────────────────────────────────────────────────────────
 RUN curl -fsSL https://deb.nodesource.com/setup_18.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
@@ -50,8 +57,8 @@ RUN yes | sdkmanager --licenses > /dev/null 2>&1 || true \
 # ─── App setup ────────────────────────────────────────────────────────────────
 WORKDIR /app
 
-COPY server/package*.json ./
-RUN npm install --omit=dev
+COPY server/package.json server/package-lock.json ./
+RUN npm ci --omit=dev
 
 COPY server/ ./
 COPY scripts/ /scripts/
