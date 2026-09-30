@@ -31,6 +31,9 @@ echo "fake gradle: $*"
 G
 chmod +x "${P}/gradlew"
 (cd "${P}" && zip -qr "${WORK}/proj.zip" .)
+# Monorepo layout: the Android project lives in a subfolder next to other files
+M="${WORK}/mono"; mkdir -p "${M}/docs"; echo hi > "${M}/README.md"; cp -r "${P}" "${M}/android-client"
+(cd "${M}" && zip -qr "${WORK}/mono.zip" .)
 
 # ── Start the API ─────────────────────────────────────────────────────────────
 export BUILDS_DIR="${WORK}/builds" UPLOADS_DIR="${WORK}/uploads" PORT
@@ -56,6 +59,14 @@ for entry in quick:apk production:apk store:aab; do
   [ "${code}" = 200 ] && grep -q "${want}" "${WORK}/out" || fail "mode=${mode}: bad download (http ${code})"
   ok "mode=${mode} → ${want}"
 done
+
+# ── Android project in a subfolder (monorepo) ─────────────────────────────────
+id=$(curl -sf -F "archive=@${WORK}/mono.zip" -F mode=quick "${API}/build" | json "['id']")
+for _ in $(seq 1 60); do
+  st=$(curl -sf "${API}/build/${id}/status" | json "['status']"); [ "${st}" = success ] || [ "${st}" = failed ] && break; sleep 1
+done
+[ "${st}" = success ] || fail "monorepo layout ended with status '${st}'"
+ok "monorepo (android-client/ subfolder) → apk"
 
 # ── Input validation ──────────────────────────────────────────────────────────
 for bad in '--upload-pack=touch /tmp/pwn' 'file:///etc' 'http://insecure.example/x.git'; do

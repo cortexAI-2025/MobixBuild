@@ -113,18 +113,28 @@ fi
 
 # ─── Locate Android project root ──────────────────────────────────────────────
 
-is_gradle_root() {
-  [ -f "$1/gradlew" ] || [ -f "$1/settings.gradle" ] || [ -f "$1/settings.gradle.kts" ]
+# Find the Gradle project: the shallowest folder (max depth 3) holding gradlew or
+# settings.gradle[.kts], preferring one that declares an Android application.
+# Handles native repos, React Native (android/), and monorepos (e.g. android-client/).
+find_gradle_root() {
+  local first="" dir
+  while IFS= read -r dir; do
+    [ -n "${first}" ] || first="${dir}"
+    if grep -rqsE "com\.android\.application" "${dir}" \
+         --include=*.gradle --include=*.gradle.kts --include=*.toml 2>/dev/null; then
+      echo "${dir}"; return 0
+    fi
+  done < <(
+    find "${SOURCE_DIR}" -maxdepth 3 \( -name node_modules -o -name .git -o -name build \) -prune -o \
+         -type f \( -name gradlew -o -name settings.gradle -o -name settings.gradle.kts \) -print 2>/dev/null \
+      | xargs -r -n1 dirname | sort -u \
+      | awk -F/ '{print NF " " $0}' | sort -n | cut -d' ' -f2-
+  )
+  [ -n "${first}" ] && echo "${first}"
 }
 
-ANDROID_DIR=""
-if is_gradle_root "${SOURCE_DIR}"; then
-  ANDROID_DIR="${SOURCE_DIR}"
-elif [ -d "${SOURCE_DIR}/android" ] && is_gradle_root "${SOURCE_DIR}/android"; then
-  ANDROID_DIR="${SOURCE_DIR}/android"
-else
-  die "No Android project found (need gradlew or settings.gradle[.kts], at the root or in android/)"
-fi
+ANDROID_DIR="$(find_gradle_root || true)"
+[ -n "${ANDROID_DIR}" ] || die "No Android project found (looked for gradlew / settings.gradle[.kts] up to 3 levels deep)"
 
 log "Android dir: ${ANDROID_DIR}"
 cd "${ANDROID_DIR}"
