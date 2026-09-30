@@ -8,3 +8,4 @@ builds/
 *.jks
 .next/
 next-env.d.ts
+*.tsbuildinfo
