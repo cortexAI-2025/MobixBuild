@@ -15,9 +15,27 @@ app.use(express.urlencoded({ extended: true }));
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
+});
+
+// ─── Optional auth ────────────────────────────────────────────────────────────
+// Set API_TOKEN to require it on every route except /health. Building a repo runs
+// its Gradle scripts, so never expose an instance publicly without a token.
+// The token is accepted as `Authorization: Bearer <t>` or `?token=<t>` (EventSource
+// and plain download links cannot send headers).
+const API_TOKEN = process.env.API_TOKEN || '';
+
+app.use((req, res, next) => {
+  if (!API_TOKEN || req.path === '/health') return next();
+  const header = req.get('authorization') || '';
+  const given = header.startsWith('Bearer ') ? header.slice(7) : (req.query.token || '');
+  const a = Buffer.from(String(given));
+  const b = Buffer.from(API_TOKEN);
+  if (a.length === b.length && require('crypto').timingSafeEqual(a, b)) return next();
+  res.status(401).json({ error: 'Invalid or missing API token' });
 });
 
 const BUILDS_DIR = process.env.BUILDS_DIR || path.join(__dirname, '..', 'builds');
@@ -37,6 +55,8 @@ const builds = new Map();
 /** @type {string[]} */
 const queue = [];
 let running = false;
+/** @type {{ id: string, proc: import('child_process').ChildProcess } | null} */
+let current = null;
 
 // SSE clients: buildId -> Set of response objects
 /** @type {Map<string, Set<import('express').Response>>} */
@@ -222,6 +242,7 @@ function processQueue() {
     detached: true, // own process group so a timeout can kill gradle & children
   });
 
+  current = { id, proc };
   let timedOut = false;
   const timer = setTimeout(() => {
     timedOut = true;
@@ -241,6 +262,7 @@ function processQueue() {
   proc.on('close', (code) => {
     clearTimeout(timer);
     running = false;
+    current = null;
     build.finishedAt = new Date().toISOString();
 
     // Secrets are only needed during the build
@@ -258,7 +280,8 @@ function processQueue() {
       }
     } else {
       build.status = 'failed';
-      appendLog(id, `[MOBIXBUILD] Build failed (${timedOut ? 'timeout' : 'exit ' + code})`);
+      const why = build.cancelled ? 'cancelled' : timedOut ? 'timeout' : 'exit ' + code;
+      appendLog(id, `[MOBIXBUILD] Build failed (${why})`);
     }
 
     persistBuild(build);
@@ -329,6 +352,8 @@ app.get('/build/:id/status', (req, res) => {
     id: build.id, status: build.status, mode: build.mode,
     createdAt: build.createdAt, startedAt: build.startedAt,
     finishedAt: build.finishedAt, logs: build.logs,
+    artifact: build.outputFile ? path.basename(build.outputFile) : null,
+    queuePosition: build.status === 'queued' ? queue.indexOf(build.id) + 1 : 0,
   });
 });
 
@@ -378,6 +403,33 @@ app.get('/build/:id/download', (req, res) => {
   res.download(outputFile, path.basename(outputFile));
 });
 
+app.post('/build/:id/cancel', (req, res) => {
+  const id = req.params.id;
+  const build = builds.get(id);
+  if (!build) return res.status(404).json({ error: 'Build not found' });
+
+  if (build.status === 'queued') {
+    const i = queue.indexOf(id);
+    if (i !== -1) queue.splice(i, 1);
+    build.status = 'failed';
+    build.cancelled = true;
+    build.finishedAt = new Date().toISOString();
+    appendLog(id, '[MOBIXBUILD] Build failed (cancelled before start)');
+    if (build.archivePath)  fs.rm(build.archivePath,  { force: true }, () => {});
+    if (build.keystorePath) fs.rm(build.keystorePath, { force: true }, () => {});
+    persistBuild(build);
+    broadcastStatus(id, 'failed');
+  } else if (build.status === 'running' && current && current.id === id) {
+    build.cancelled = true;
+    appendLog(id, '[MOBIXBUILD] Cancel requested — stopping build');
+    try { process.kill(-current.proc.pid, 'SIGKILL'); } catch (_) {}
+    // the 'close' handler finalises status, persistence and SSE
+  } else {
+    return res.status(409).json({ error: `Build is already ${build.status}` });
+  }
+  res.json({ id, status: 'cancelling' });
+});
+
 app.get('/builds', (_req, res) => {
   const list = [...builds.values()]
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
@@ -388,7 +440,7 @@ app.get('/builds', (_req, res) => {
 });
 
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', queued: queue.length, running, builds: builds.size });
+  res.json({ status: 'ok', queued: queue.length, running, builds: builds.size, auth: !!API_TOKEN });
 });
 
 loadPersistedBuilds();

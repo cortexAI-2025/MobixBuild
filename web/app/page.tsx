@@ -3,6 +3,28 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000';
+const TOKEN_KEY = 'mobixbuild.token';
+
+interface BuildSummary {
+  id: string;
+  status: 'queued' | 'running' | 'success' | 'failed';
+  mode: Mode;
+  repoUrl: string | null;
+  createdAt: string;
+}
+
+async function readError(res: Response) {
+  const text = await res.text().catch(() => '');
+  try { return JSON.parse(text).error || text || `HTTP ${res.status}`; } catch { return text || `HTTP ${res.status}`; }
+}
+
+function timeAgo(iso: string) {
+  const s = Math.max(0, Math.round((Date.now() - Date.parse(iso)) / 1000));
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+}
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -152,11 +174,61 @@ export default function Home() {
   const [progress, setProgress] = useState(0);
   const [elapsed, setElapsed]   = useState(0);
   const [error, setError]       = useState<string | null>(null);
+  const [token, setToken]       = useState('');
+  const [online, setOnline]     = useState<boolean | null>(null);
+  const [authRequired, setAuthRequired] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [history, setHistory]   = useState<BuildSummary[]>([]);
+  const [keystore, setKeystore] = useState<File | null>(null);
+  const [ksPass, setKsPass]     = useState('');
+  const [keyAlias, setKeyAlias] = useState('');
+  const [keyPass, setKeyPass]   = useState('');
+  const [queuePos, setQueuePos] = useState(0);
 
   const esRef          = useRef<EventSource | null>(null);
   const progressRef    = useRef<ReturnType<typeof setInterval> | null>(null);
   const elapsedRef     = useRef<ReturnType<typeof setInterval> | null>(null);
   const fileInputRef   = useRef<HTMLInputElement>(null);
+  const pollRef        = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // ── API helpers (token-aware) ──────────────────────────────────────────────
+  const authHeaders = useCallback((): HeadersInit => (token ? { Authorization: `Bearer ${token}` } : {}), [token]);
+  const withToken   = useCallback((url: string) => (token ? `${url}${url.includes('?') ? '&' : '?'}token=${encodeURIComponent(token)}` : url), [token]);
+
+  useEffect(() => {
+    try { setToken(localStorage.getItem(TOKEN_KEY) || ''); } catch (_) {}
+  }, []);
+
+  const saveToken = (t: string) => {
+    setToken(t);
+    try { t ? localStorage.setItem(TOKEN_KEY, t) : localStorage.removeItem(TOKEN_KEY); } catch (_) {}
+  };
+
+  // Server health (drives the status pill and the token prompt)
+  useEffect(() => {
+    let alive = true;
+    const check = async () => {
+      try {
+        const r = await fetch(`${API}/health`);
+        const d = await r.json();
+        if (!alive) return;
+        setOnline(r.ok);
+        setAuthRequired(!!d.auth);
+      } catch (_) { if (alive) setOnline(false); }
+    };
+    check();
+    const iv = setInterval(check, 15000);
+    return () => { alive = false; clearInterval(iv); };
+  }, []);
+
+  const loadHistory = useCallback(async () => {
+    try {
+      const r = await fetch(`${API}/builds`, { headers: authHeaders() });
+      if (r.ok) setHistory(await r.json());
+    } catch (_) {}
+  }, [authHeaders]);
+
+  useEffect(() => { if (phase === 'idle') loadHistory(); }, [phase, loadHistory]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -164,12 +236,14 @@ export default function Home() {
       esRef.current?.close();
       if (progressRef.current) clearInterval(progressRef.current);
       if (elapsedRef.current)  clearInterval(elapsedRef.current);
+      if (pollRef.current)     clearInterval(pollRef.current);
     };
   }, []);
 
   const clearTimers = useCallback(() => {
     if (progressRef.current) { clearInterval(progressRef.current); progressRef.current = null; }
     if (elapsedRef.current)  { clearInterval(elapsedRef.current);  elapsedRef.current  = null; }
+    if (pollRef.current)     { clearInterval(pollRef.current);     pollRef.current     = null; }
   }, []);
 
   // ── Drag & drop ─────────────────────────────────────────────────────────────
@@ -182,8 +256,14 @@ export default function Home() {
 
   // ── SSE / polling ────────────────────────────────────────────────────────────
   const connectSSE = useCallback((id: string) => {
-    const es = new EventSource(`${API}/build/${id}/logs/stream`);
+    setLogs([]);
+    const es = new EventSource(withToken(`${API}/build/${id}/logs/stream`));
     esRef.current = es;
+
+    es.addEventListener('status', (e) => {
+      const { status } = JSON.parse(e.data);
+      if (status !== 'queued') setQueuePos(0);
+    });
 
     es.addEventListener('log', (e) => {
       const { line } = JSON.parse(e.data);
@@ -200,27 +280,64 @@ export default function Home() {
 
     es.onerror = () => {
       es.close();
-      // Fallback to polling
-      const iv = setInterval(async () => {
+      if (pollRef.current) return;
+      // Fallback to polling (proxies that buffer SSE, dropped connection…)
+      pollRef.current = setInterval(async () => {
         try {
-          const r = await fetch(`${API}/build/${id}/status`);
+          const r = await fetch(`${API}/build/${id}/status`, { headers: authHeaders() });
+          if (!r.ok) throw new Error(await readError(r));
           const d = await r.json();
           setLogs(d.logs || []);
+          setQueuePos(d.queuePosition || 0);
           if (d.status === 'success' || d.status === 'failed') {
-            clearInterval(iv);
             clearTimers();
             setProgress(100);
             setPhase(d.status);
           }
-        } catch (_) {}
+        } catch (err) {
+          clearTimers();
+          setError(err instanceof Error ? err.message : 'Lost connection to the build server');
+          setPhase('failed');
+        }
       }, 2000);
     };
-  }, [clearTimers]);
+  }, [clearTimers, withToken, authHeaders]);
+
+  // Poll the queue position while waiting for a free builder
+  useEffect(() => {
+    if (phase !== 'building' || !buildId) return;
+    let alive = true;
+    const check = async () => {
+      try {
+        const r = await fetch(`${API}/build/${buildId}/status`, { headers: authHeaders() });
+        if (r.ok && alive) setQueuePos((await r.json()).queuePosition || 0);
+      } catch (_) {}
+    };
+    check();
+    const iv = setInterval(check, 5000);
+    return () => { alive = false; clearInterval(iv); };
+  }, [phase, buildId, authHeaders]);
 
   // ── Submit build ─────────────────────────────────────────────────────────────
+  const startTimers = (secs: number) => {
+    let ticks = 0;
+    progressRef.current = setInterval(() => {
+      ticks++;
+      setProgress(Math.min(92, Math.round((1 - Math.exp((-3 * ticks * 2) / secs)) * 100)));
+    }, 2000);
+    elapsedRef.current = setInterval(() => setElapsed((s) => s + 1), 1000);
+  };
+
   const startBuild = async () => {
-    if (!repoUrl.trim() && !file) {
-      setError('Enter a GitHub URL or upload a ZIP file');
+    const url = tab === 'url' ? repoUrl.trim() : '';
+    const archive = tab === 'zip' ? file : null;
+    if (!url && !archive) {
+      setError(tab === 'url' ? 'Enter a repository URL' : 'Choose a .zip archive');
+      return;
+    }
+    if (authRequired && !token) {
+      setShowSettings(true);
+      setError('This server requires an API token (⚙ Settings)');
       return;
     }
     setError(null);
@@ -229,28 +346,22 @@ export default function Home() {
     setElapsed(0);
     setPhase('building');
 
-    const totalSecs = MODES.find((m) => m.id === mode)!.seconds;
-
-    // Progress (exponential growth toward ~92%)
-    let ticks = 0;
-    progressRef.current = setInterval(() => {
-      ticks++;
-      setProgress(Math.min(92, Math.round((1 - Math.exp((-3 * ticks * 2) / totalSecs)) * 100)));
-    }, 2000);
-
-    elapsedRef.current = setInterval(() => setElapsed((s) => s + 1), 1000);
+    startTimers(MODES.find((m) => m.id === mode)!.seconds);
 
     const fd = new FormData();
-    if (repoUrl.trim()) fd.append('repoUrl', repoUrl.trim());
-    if (file) fd.append('archive', file);
+    if (url) fd.append('repoUrl', url);
+    if (archive) fd.append('archive', archive);
     fd.append('mode', mode);
+    if (mode !== 'quick' && keystore) {
+      fd.append('keystore', keystore);
+      fd.append('keystorePass', ksPass);
+      fd.append('keyAlias', keyAlias || 'release');
+      fd.append('keyPass', keyPass || ksPass);
+    }
 
     try {
-      const res = await fetch(`${API}/build`, { method: 'POST', body: fd });
-      if (!res.ok) {
-        const msg = await res.text().catch(() => `HTTP ${res.status}`);
-        throw new Error(msg);
-      }
+      const res = await fetch(`${API}/build`, { method: 'POST', body: fd, headers: authHeaders() });
+      if (!res.ok) throw new Error(await readError(res));
       const data = await res.json();
       setBuildId(data.id);
       connectSSE(data.id);
@@ -263,7 +374,29 @@ export default function Home() {
 
   // ── Download ──────────────────────────────────────────────────────────────
   const download = () => {
-    if (buildId) window.open(`${API}/build/${buildId}/download`, '_blank');
+    if (buildId) window.open(withToken(`${API}/build/${buildId}/download`), '_blank');
+  };
+
+  // ── Re-open a build from history ──────────────────────────────────────────
+  const openBuild = (b: BuildSummary) => {
+    setError(null);
+    setMode(b.mode);
+    setBuildId(b.id);
+    setElapsed(0);
+    setProgress(b.status === 'success' || b.status === 'failed' ? 100 : 0);
+    setPhase('building');
+    if (b.status === 'queued' || b.status === 'running') startTimers(MODES.find((m) => m.id === b.mode)!.seconds);
+    connectSSE(b.id);
+  };
+
+  // ── Cancel (stops the build on the server, not just the UI) ──────────────
+  const cancel = async () => {
+    if (buildId) {
+      try {
+        await fetch(`${API}/build/${buildId}/cancel`, { method: 'POST', headers: authHeaders() });
+      } catch (_) {}
+    }
+    reset();
   };
 
   // ── Reset ─────────────────────────────────────────────────────────────────
@@ -297,9 +430,10 @@ export default function Home() {
       <nav className="relative z-10 border-b border-white/5 px-6 py-4 flex items-center justify-between max-w-screen-xl mx-auto">
         <Logo />
         <div className="flex items-center gap-6 text-sm text-white/40">
-          <a href="#" className="hover:text-white/80 transition-colors">Docs</a>
-          <a href="#" className="hover:text-white/80 transition-colors">Pricing</a>
-          <a href="https://github.com" className="hover:text-white/80 transition-colors">GitHub</a>
+          <button onClick={() => setShowSettings((v) => !v)} className="hover:text-white/80 transition-colors">
+            ⚙ Settings{authRequired && !token ? ' •' : ''}
+          </button>
+          <a href="https://github.com/cortexAI-2025/MobixBuild" className="hover:text-white/80 transition-colors">GitHub</a>
         </div>
       </nav>
 
@@ -309,8 +443,10 @@ export default function Home() {
         {/* Hero */}
         <div className="text-center mb-12">
           <div className="inline-flex items-center gap-2 glass rounded-full px-4 py-1.5 text-xs text-white/50 mb-6 border border-white/5">
-            <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
-            Build service online
+            <span className={`w-1.5 h-1.5 rounded-full ${
+              online === null ? 'bg-white/30' : online ? 'bg-green-400 animate-pulse' : 'bg-red-400'
+            }`} />
+            {online === null ? 'Checking build service…' : online ? 'Build service online' : `Build service unreachable (${API})`}
           </div>
           <h1 className="text-5xl font-bold leading-tight mb-4">
             Build Mobile Apps.
@@ -319,6 +455,25 @@ export default function Home() {
           </h1>
           <p className="text-white/40 text-lg">From repo to APK in one click</p>
         </div>
+
+        {/* ── Settings ──────────────────────────────────────────────────────── */}
+        {showSettings && (
+          <div className="glass rounded-2xl p-5 mb-6 space-y-3 animate-fade-in">
+            <p className="text-xs text-white/30 uppercase tracking-wider font-semibold">Server</p>
+            <p className="text-xs text-white/40 font-mono break-all">{API}</p>
+            <label className="block text-xs text-white/40">
+              API token {authRequired ? '(required by this server)' : '(not required by this server)'}
+              <input
+                type="password"
+                value={token}
+                onChange={(e) => saveToken(e.target.value.trim())}
+                placeholder="API_TOKEN"
+                className="mt-1 w-full bg-white/5 border border-white/10 rounded-xl px-4 py-2.5 text-sm text-white placeholder:text-white/25 focus:outline-none focus:border-mblue/60"
+              />
+            </label>
+            <p className="text-[11px] text-white/25">Stored in this browser only.</p>
+          </div>
+        )}
 
         {/* ── IDLE: input form ──────────────────────────────────────────────── */}
         {phase === 'idle' && (
@@ -364,7 +519,7 @@ export default function Home() {
                     ? 'border-mblue/70 bg-mblue/10'
                     : file
                     ? 'border-green-500/50 bg-green-500/5'
-                    : 'border-white/10 hover:border-white/25 hover:bg-white/3'
+                    : 'border-white/10 hover:border-white/25 hover:bg-white/5'
                 }`}
               >
                 <input
@@ -409,7 +564,7 @@ export default function Home() {
                     className={`p-4 rounded-xl border text-left transition-all duration-200 ${
                       mode === m.id
                         ? 'border-mblue/60 bg-mblue/10 shadow-[0_0_20px_rgba(37,99,235,0.2)]'
-                        : 'border-white/8 hover:border-white/20 bg-white/3 hover:bg-white/5'
+                        : 'border-white/10 hover:border-white/20 bg-white/5 hover:bg-white/5'
                     }`}
                   >
                     <div className="text-xl mb-2">{m.icon}</div>
@@ -427,6 +582,47 @@ export default function Home() {
               </div>
             </div>
 
+            {/* Signing (production / store) */}
+            {mode !== 'quick' && (
+              <div className="space-y-3 border border-white/10 rounded-xl p-4 bg-white/5">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <p className="text-sm text-white/80 font-medium">Signing keystore</p>
+                    <p className="text-[11px] text-white/30">
+                      {keystore ? keystore.name : 'Optional — a throw-away key is generated otherwise. Use your own for Google Play.'}
+                    </p>
+                  </div>
+                  <label className="text-xs text-white/60 border border-white/15 rounded-lg px-3 py-1.5 cursor-pointer hover:bg-white/5 whitespace-nowrap">
+                    {keystore ? 'Change' : 'Upload .jks'}
+                    <input type="file" accept=".jks,.keystore,.p12" className="hidden"
+                           onChange={(e) => setKeystore(e.target.files?.[0] || null)} />
+                  </label>
+                </div>
+                {keystore && (
+                  <div className="grid grid-cols-3 gap-2">
+                    {[
+                      ['Store password', ksPass, setKsPass, 'password'],
+                      ['Key alias', keyAlias, setKeyAlias, 'text'],
+                      ['Key password', keyPass, setKeyPass, 'password'],
+                    ].map(([label, value, set, type]) => (
+                      <input
+                        key={label as string}
+                        type={type as string}
+                        value={value as string}
+                        placeholder={label as string}
+                        onChange={(e) => (set as (v: string) => void)(e.target.value)}
+                        className="bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs text-white placeholder:text-white/25 focus:outline-none focus:border-mblue/60"
+                      />
+                    ))}
+                    <button onClick={() => { setKeystore(null); setKsPass(''); setKeyAlias(''); setKeyPass(''); }}
+                            className="col-span-3 text-[11px] text-white/30 hover:text-white/60 text-left">
+                      Remove keystore
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* Error */}
             {error && (
               <p className="text-red-400 text-sm bg-red-500/10 border border-red-500/20 rounded-xl px-4 py-3">
@@ -438,6 +634,30 @@ export default function Home() {
             <button onClick={startBuild} className="btn-primary w-full text-center">
               Build Now →
             </button>
+          </div>
+        )}
+
+        {/* ── Recent builds ─────────────────────────────────────────────────── */}
+        {phase === 'idle' && history.length > 0 && (
+          <div className="mt-8 animate-fade-in">
+            <p className="text-xs text-white/30 uppercase tracking-wider font-semibold mb-3">Recent builds</p>
+            <div className="glass rounded-2xl divide-y divide-white/5">
+              {history.slice(0, 10).map((b) => (
+                <button key={b.id} onClick={() => openBuild(b)}
+                        className="w-full flex items-center gap-3 px-4 py-3 text-left hover:bg-white/5 transition-colors">
+                  <span className={`text-xs font-semibold w-16 ${
+                    b.status === 'success' ? 'text-green-400' : b.status === 'failed' ? 'text-red-400' : 'text-blue-400'
+                  }`}>
+                    {b.status === 'success' ? '✓ ok' : b.status === 'failed' ? '✗ failed' : `⏳ ${b.status}`}
+                  </span>
+                  <span className="flex-1 text-sm text-white/60 truncate">
+                    {b.repoUrl ? b.repoUrl.replace(/^https:\/\/(www\.)?github\.com\//, '') : 'Uploaded archive'}
+                  </span>
+                  <span className="text-[11px] text-white/30">{MODES.find((m) => m.id === b.mode)?.label}</span>
+                  <span className="text-[11px] text-white/20 w-14 text-right">{timeAgo(b.createdAt)}</span>
+                </button>
+              ))}
+            </div>
           </div>
         )}
 
@@ -470,7 +690,7 @@ export default function Home() {
               <ProgressBar value={progress} />
 
               <div className="flex justify-between mt-2 text-xs text-white/25">
-                <span>Elapsed: {fmtSecs(elapsed)}</span>
+                <span>{queuePos > 0 ? `Waiting in queue — position ${queuePos}` : `Elapsed: ${fmtSecs(elapsed)}`}</span>
                 {phase === 'building' && (
                   <span>~{fmtSecs(estRemaining)} remaining</span>
                 )}
@@ -502,7 +722,7 @@ export default function Home() {
               <div className="glass rounded-2xl p-5 flex items-center justify-between animate-fade-in">
                 <div>
                   <p className="font-semibold text-red-400 mb-1">Build failed</p>
-                  <p className="text-xs text-white/30">Check the logs above for details</p>
+                  <p className="text-xs text-white/40 break-words">{error || 'Check the logs above for details'}</p>
                 </div>
                 <button onClick={reset} className="btn-primary text-sm">
                   Try Again
@@ -511,8 +731,8 @@ export default function Home() {
             )}
 
             {phase === 'building' && (
-              <button onClick={reset} className="w-full text-center text-xs text-white/20 hover:text-white/40 py-2 transition-colors">
-                Cancel
+              <button onClick={cancel} className="w-full text-center text-xs text-white/20 hover:text-red-400/70 py-2 transition-colors">
+                Cancel build
               </button>
             )}
 

@@ -21,6 +21,7 @@ echo x > "${P}/gradle/wrapper/gradle-wrapper.jar"
 echo "rootProject.name='fake'" > "${P}/settings.gradle"
 cat > "${P}/gradlew" <<'G'
 #!/usr/bin/env bash
+[ -f slow ] && sleep 60
 case "$1" in
   assembleDebug)   d=app/build/outputs/apk/debug;      mkdir -p $d; echo apk > $d/app-debug.apk;;
   assembleRelease) d=app/build/outputs/apk/release;    mkdir -p $d; echo apk > $d/app-release-unsigned.apk;;
@@ -31,6 +32,9 @@ echo "fake gradle: $*"
 G
 chmod +x "${P}/gradlew"
 (cd "${P}" && zip -qr "${WORK}/proj.zip" .)
+# Slow variant (gradlew sleeps) to test cancellation
+SL="${WORK}/slow"; cp -r "${P}" "${SL}"; touch "${SL}/slow"
+(cd "${SL}" && zip -qr "${WORK}/slow.zip" .)
 # Monorepo layout: the Android project lives in a subfolder next to other files
 M="${WORK}/mono"; mkdir -p "${M}/docs"; echo hi > "${M}/README.md"; cp -r "${P}" "${M}/android-client"
 (cd "${M}" && zip -qr "${WORK}/mono.zip" .)
@@ -77,5 +81,40 @@ ok "malicious repoUrl rejected"
 code=$(curl -s -o /dev/null -w '%{http_code}' -F mode=nope -F "archive=@${WORK}/proj.zip" "${API}/build")
 [ "${code}" = 400 ] || fail "invalid mode accepted"
 ok "invalid mode rejected"
+
+# ── Cancellation: running build is killed, queued build is dropped ────────────
+wait_status() { # id wanted → echoes final status
+  local st=""
+  for _ in $(seq 1 30); do
+    st=$(curl -sf "${API}/build/$1/status" | json "['status']"); [ "${st}" = "$2" ] && break; sleep 0.5
+  done
+  echo "${st}"
+}
+run_id=$(curl -sf -F "archive=@${WORK}/slow.zip" -F mode=quick "${API}/build" | json "['id']")
+[ "$(wait_status "${run_id}" running)" = running ] || fail "slow build never started"
+queued_id=$(curl -sf -F "archive=@${WORK}/proj.zip" -F mode=quick "${API}/build" | json "['id']")
+[ "$(curl -sf "${API}/build/${queued_id}/status" | json "['queuePosition']")" = 1 ] || fail "queuePosition not reported"
+curl -sf -X POST "${API}/build/${queued_id}/cancel" >/dev/null || fail "cancel queued failed"
+[ "$(wait_status "${queued_id}" failed)" = failed ] || fail "queued build not cancelled"
+start=$(date +%s)
+curl -sf -X POST "${API}/build/${run_id}/cancel" >/dev/null || fail "cancel running failed"
+[ "$(wait_status "${run_id}" failed)" = failed ] || fail "running build not killed"
+[ $(( $(date +%s) - start )) -lt 10 ] || fail "cancel took too long"
+curl -sf "${API}/build/${run_id}/status" | grep -q "cancelled" || fail "cancel reason not logged"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "${API}/build/${run_id}/cancel")
+[ "${code}" = 409 ] || fail "cancelling a finished build should be 409 (got ${code})"
+ok "cancel (queued + running)"
+
+# ── Token auth ────────────────────────────────────────────────────────────────
+kill "${SERVER_PID}"; wait "${SERVER_PID}" 2>/dev/null || true
+API_TOKEN=s3cret node "${ROOT}/server/index.js" >> "${WORK}/server.log" 2>&1 &
+SERVER_PID=$!
+for _ in $(seq 1 20); do curl -sf "${API}/health" >/dev/null && break; sleep 0.5; done
+[ "$(curl -s -o /dev/null -w '%{http_code}' "${API}/health")" = 200 ]            || fail "/health must stay public"
+[ "$(curl -s -o /dev/null -w '%{http_code}' "${API}/builds")" = 401 ]            || fail "no token accepted"
+[ "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer nope' "${API}/builds")" = 401 ] || fail "bad token accepted"
+[ "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer s3cret' "${API}/builds")" = 200 ] || fail "bearer token rejected"
+[ "$(curl -s -o /dev/null -w '%{http_code}' "${API}/builds?token=s3cret")" = 200 ] || fail "query token rejected"
+ok "API_TOKEN auth (header + query, /health public)"
 
 echo "ALL E2E TESTS PASSED"

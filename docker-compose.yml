@@ -22,6 +22,7 @@ services:
       PORT: "3000"
       BUILDS_DIR: "/builds"
       SCRIPTS_DIR: "/scripts"
+      API_TOKEN: "${API_TOKEN:-}"          # empty = open (local use only)
       BUILD_TIMEOUT_MIN: "30"
       BUILD_RETENTION_HOURS: "24"
     restart: unless-stopped

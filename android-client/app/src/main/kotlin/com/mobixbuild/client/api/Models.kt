@@ -13,6 +13,15 @@ data class BuildStatus(
     val createdAt: String? = null,
     val startedAt: String? = null,
     val finishedAt: String? = null,
+    val artifact: String? = null,
+    val queuePosition: Int = 0,
+)
+
+data class Health(
+    val status: String,
+    val queued: Int = 0,
+    val running: Boolean = false,
+    val auth: Boolean = false,
 )
 
 enum class BuildMode(val id: String, val label: String, val badge: String, val estSeconds: Int) {

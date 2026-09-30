@@ -3,6 +3,7 @@ package com.mobixbuild.client
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.provider.OpenableColumns
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -47,7 +48,6 @@ import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.File
 import java.io.FileOutputStream
-import java.net.URL
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
@@ -63,6 +63,7 @@ sealed class Screen {
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Api.init(applicationContext)
         enableEdgeToEdge()
         setContent {
             MobixBuildTheme {
@@ -94,6 +95,13 @@ fun MobixBuildApp() {
     var elapsed    by remember { mutableStateOf(0) }
     var localApk   by remember { mutableStateOf<File?>(null) }
     var error      by remember { mutableStateOf("") }
+    var queuePos   by remember { mutableStateOf(0) }
+
+    // Settings (server URL + token, persisted by Api)
+    var showSettings by remember { mutableStateOf(false) }
+    var serverInput  by remember { mutableStateOf(Api.baseUrl) }
+    var tokenInput   by remember { mutableStateOf(Api.token) }
+    var healthMsg    by remember { mutableStateOf("") }
 
     val logState   = rememberLazyListState()
     var pollJob    by remember { mutableStateOf<Job?>(null) }
@@ -105,7 +113,35 @@ fun MobixBuildApp() {
 
     // File picker
     val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
-        uri?.let { fileUri = it; fileName = it.lastPathSegment ?: "archive.zip" }
+        uri?.let {
+            fileUri = it
+            fileName = context.contentResolver.query(it, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                ?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
+                ?: "archive.zip"
+        }
+    }
+
+    fun testServer() {
+        focus.clearFocus()
+        Api.save(context, serverInput, tokenInput)
+        serverInput = Api.baseUrl
+        healthMsg = "Testing…"
+        scope.launch {
+            healthMsg = try {
+                val h = Api.service.health()
+                val authOk = if (h.auth) {
+                    try { Api.service.getStatus("_probe_"); true }
+                    catch (e: retrofit2.HttpException) { e.code() != 401 }
+                } else true
+                when {
+                    !authOk -> "✗ Reachable, but the API token is wrong"
+                    h.auth  -> "✓ Connected (token OK) — ${h.queued} queued"
+                    else    -> "✓ Connected — ${h.queued} queued"
+                }
+            } catch (e: Exception) {
+                "✗ ${Api.describe(e)}"
+            }
+        }
     }
 
     // ── Build logic ──────────────────────────────────────────────────────────
@@ -115,6 +151,7 @@ fun MobixBuildApp() {
         if (url == null && fileUri == null) { error = "Enter a GitHub URL or pick a ZIP file"; return }
 
         error = ""
+        queuePos = 0
         screen = Screen.Building
         logs = listOf()
         progress = 0f
@@ -123,25 +160,31 @@ fun MobixBuildApp() {
 
         pollJob = scope.launch {
             // Submit
+            var tmp: File? = null
             val id = try {
                 val modeBody    = mode.id.toRequestBody("text/plain".toMediaTypeOrNull())
                 val repoBody    = url?.toRequestBody("text/plain".toMediaTypeOrNull())
                 var archivePart: MultipartBody.Part? = null
                 if (fileUri != null) {
-                    val tmp = File(context.cacheDir, "upload_${System.currentTimeMillis()}.zip")
-                    context.contentResolver.openInputStream(fileUri!!)?.use { i ->
-                        FileOutputStream(tmp).use { o -> i.copyTo(o) }
+                    val f = File(context.cacheDir, "upload_${System.currentTimeMillis()}.zip")
+                    tmp = f
+                    withContext(Dispatchers.IO) {
+                        context.contentResolver.openInputStream(fileUri!!)?.use { i ->
+                            FileOutputStream(f).use { o -> i.copyTo(o) }
+                        } ?: throw java.io.IOException("Cannot read the selected file")
                     }
                     archivePart = MultipartBody.Part.createFormData(
                         "archive", "archive.zip",
-                        tmp.asRequestBody("application/zip".toMediaTypeOrNull())
+                        f.asRequestBody("application/zip".toMediaTypeOrNull())
                     )
                 }
                 Api.service.startBuild(repoBody, archivePart, modeBody).id
             } catch (e: Exception) {
-                error = e.message ?: "Submit failed"
+                error = Api.describe(e)
                 screen = Screen.Failed
                 return@launch
+            } finally {
+                tmp?.delete()
             }
 
             buildId = id
@@ -149,11 +192,14 @@ fun MobixBuildApp() {
             val totalSecs = mode.estSeconds.toFloat()
 
             // Poll loop
+            var failures = 0
             while (isActive) {
                 delay(2000)
                 try {
                     val s = Api.service.getStatus(id)
+                    failures = 0
                     logs = s.logs
+                    queuePos = s.queuePosition
                     elapsed = ((System.currentTimeMillis() - startMs) / 1000).toInt()
                     progress = minOf(0.92f,
                         (1f - Math.exp((-3.0 * elapsed / totalSecs).toDouble()).toFloat()))
@@ -162,7 +208,17 @@ fun MobixBuildApp() {
                         "success" -> { progress = 1f; screen = Screen.Success; return@launch }
                         "failed"  -> { screen = Screen.Failed; return@launch }
                     }
-                } catch (_: Exception) {}
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    // 404 = build purged / server reset; otherwise give up after ~1 min offline
+                    val gone = e is retrofit2.HttpException && (e.code() == 404 || e.code() == 401)
+                    if (gone || ++failures >= 30) {
+                        error = Api.describe(e)
+                        screen = Screen.Failed
+                        return@launch
+                    }
+                }
             }
         }
     }
@@ -170,22 +226,42 @@ fun MobixBuildApp() {
     fun reset() {
         pollJob?.cancel()
         screen = Screen.Idle
-        buildId = ""; logs = listOf(); progress = 0f; elapsed = 0; error = ""
+        buildId = ""; logs = listOf(); progress = 0f; elapsed = 0; error = ""; queuePos = 0
+    }
+
+    // Stops the build on the server too, not just the UI
+    fun cancelBuild() {
+        val id = buildId
+        reset()
+        if (id.isNotEmpty()) scope.launch { try { Api.service.cancel(id) } catch (_: Exception) {} }
     }
 
     fun downloadApk() {
         scope.launch {
             try {
                 val dest = File(context.cacheDir, "mobixbuild_${buildId.take(8)}${ if (mode == BuildMode.STORE) ".aab" else ".apk" }")
-                withContext(Dispatchers.IO) {
-                    URL("${BuildConfig.API_BASE_URL}/build/$buildId/download")
-                        .openStream().use { i -> FileOutputStream(dest).use { o -> i.copyTo(o) } }
-                }
+                withContext(Dispatchers.IO) { Api.download(buildId, dest) }
                 localApk = dest
                 Toast.makeText(context, "Downloaded: ${dest.name}", Toast.LENGTH_SHORT).show()
             } catch (e: Exception) {
-                Toast.makeText(context, "Download failed: ${e.message}", Toast.LENGTH_LONG).show()
+                Toast.makeText(context, "Download failed: ${Api.describe(e)}", Toast.LENGTH_LONG).show()
             }
+        }
+    }
+
+    // AAB can't be installed — hand it to Drive / Files / mail instead
+    fun shareFile(file: File) {
+        try {
+            val uri = FileProvider.getUriForFile(context, "${context.packageName}.provider", file)
+            context.startActivity(Intent.createChooser(
+                Intent(Intent.ACTION_SEND).apply {
+                    type = "application/octet-stream"
+                    putExtra(Intent.EXTRA_STREAM, uri)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }, "Save ${file.name}"
+            ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        } catch (e: Exception) {
+            Toast.makeText(context, "Share error: ${e.message}", Toast.LENGTH_LONG).show()
         }
     }
 
@@ -224,7 +300,11 @@ fun MobixBuildApp() {
             ) { Text("M", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp) }
             Text("MobixBuild", fontWeight = FontWeight.Bold, fontSize = 20.sp, color = TextPri)
             Spacer(Modifier.weight(1f))
-            if (screen != Screen.Idle) {
+            if (screen == Screen.Idle) {
+                TextButton(onClick = { showSettings = !showSettings; healthMsg = "" }) {
+                    Text(if (showSettings) "✕ Close" else "⚙ Server", color = TextMuted, fontSize = 13.sp)
+                }
+            } else if (screen != Screen.Building) {
                 TextButton(onClick = ::reset) { Text("← New", color = TextMuted, fontSize = 13.sp) }
             }
         }
@@ -234,6 +314,51 @@ fun MobixBuildApp() {
         // ── INPUT (only visible when idle) ────────────────────────────────────
         AnimatedVisibility(screen == Screen.Idle, enter = fadeIn(), exit = fadeOut()) {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+
+                if (showSettings) {
+                    val fieldColors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = MBlue, unfocusedBorderColor = BgCard,
+                        focusedTextColor = TextPri, unfocusedTextColor = TextPri,
+                        cursorColor = MBlue, focusedLabelColor = MBlue, unfocusedLabelColor = TextMuted,
+                    )
+                    Column(
+                        Modifier
+                            .fillMaxWidth()
+                            .background(BgSurface, RoundedCornerShape(12.dp))
+                            .padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        OutlinedTextField(
+                            value = serverInput, onValueChange = { serverInput = it },
+                            modifier = Modifier.fillMaxWidth(), singleLine = true,
+                            label = { Text("Server URL", fontSize = 12.sp) },
+                            placeholder = { Text("http://192.168.1.10:3000", color = TextMuted, fontSize = 13.sp) },
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Next),
+                            shape = RoundedCornerShape(10.dp), colors = fieldColors,
+                        )
+                        OutlinedTextField(
+                            value = tokenInput, onValueChange = { tokenInput = it },
+                            modifier = Modifier.fillMaxWidth(), singleLine = true,
+                            label = { Text("API token (if the server requires one)", fontSize = 12.sp) },
+                            visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, imeAction = ImeAction.Done),
+                            keyboardActions = KeyboardActions(onDone = { testServer() }),
+                            shape = RoundedCornerShape(10.dp), colors = fieldColors,
+                        )
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                healthMsg.ifEmpty { "Emulator → 10.0.2.2 · Phone → your computer's LAN IP" },
+                                color = when {
+                                    healthMsg.startsWith("✓") -> Success
+                                    healthMsg.startsWith("✗") -> Danger
+                                    else -> TextMuted
+                                },
+                                fontSize = 11.sp, modifier = Modifier.weight(1f),
+                            )
+                            TextButton(onClick = ::testServer) { Text("Save & test", color = MBlue, fontSize = 13.sp) }
+                        }
+                    }
+                }
 
                 // URL input
                 OutlinedTextField(
@@ -360,7 +485,11 @@ fun MobixBuildApp() {
                     Text(label, color = dotColor, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
                     Spacer(Modifier.weight(1f))
                     val m = elapsed / 60; val s = elapsed % 60
-                    Text(String.format("%d:%02d", m, s), color = TextMuted, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+                    Text(
+                        if (screen == Screen.Building && queuePos > 0) "queue #$queuePos"
+                        else String.format("%d:%02d", m, s),
+                        color = TextMuted, fontSize = 12.sp, fontFamily = FontFamily.Monospace,
+                    )
                 }
 
                 // Progress bar
@@ -436,11 +565,7 @@ fun MobixBuildApp() {
                 Button(
                     onClick   = {
                         if (localApk != null) {
-                            if (mode != BuildMode.STORE) installApk(localApk!!)
-                            else context.startActivity(
-                                Intent(Intent.ACTION_VIEW, Uri.parse("${BuildConfig.API_BASE_URL}/build/$buildId/download"))
-                                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                            )
+                            if (mode != BuildMode.STORE) installApk(localApk!!) else shareFile(localApk!!)
                         } else {
                             downloadApk()
                         }
@@ -457,28 +582,53 @@ fun MobixBuildApp() {
                         contentAlignment = Alignment.Center
                     ) {
                         Text(
-                            if (localApk != null && mode != BuildMode.STORE) "Install APK 📲"
-                            else if (mode == BuildMode.STORE) "Download AAB ↓"
-                            else "Download APK ↓",
+                            when {
+                                localApk != null && mode != BuildMode.STORE -> "Install APK 📲"
+                                localApk != null -> "Save / share AAB ↗"
+                                mode == BuildMode.STORE -> "Download AAB ↓"
+                                else -> "Download APK ↓"
+                            },
                             color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 14.sp
                         )
                     }
                 }
 
-                if (localApk == null) {
-                    OutlinedButton(
-                        onClick  = { downloadApk() },
-                        modifier = Modifier.fillMaxWidth().height(44.dp),
-                        shape    = RoundedCornerShape(12.dp),
-                        colors   = ButtonDefaults.outlinedButtonColors(contentColor = TextPri),
-                    ) {
-                        Text("Save to device", fontSize = 13.sp)
-                    }
+                OutlinedButton(
+                    onClick  = {
+                        context.startActivity(
+                            Intent(Intent.ACTION_VIEW, Uri.parse(Api.downloadUrl(buildId)))
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        )
+                    },
+                    modifier = Modifier.fillMaxWidth().height(44.dp),
+                    shape    = RoundedCornerShape(12.dp),
+                    colors   = ButtonDefaults.outlinedButtonColors(contentColor = TextPri),
+                ) {
+                    Text("Open in browser", fontSize = 13.sp)
                 }
             }
         }
 
-        // ── RETRY (failed state) ──────────────────────────────────────────────
+        // ── CANCEL (building state) ───────────────────────────────────────────
+        AnimatedVisibility(screen == Screen.Building) {
+            OutlinedButton(
+                onClick  = ::cancelBuild,
+                modifier = Modifier.fillMaxWidth().height(44.dp),
+                shape    = RoundedCornerShape(12.dp),
+                colors   = ButtonDefaults.outlinedButtonColors(contentColor = Danger),
+            ) {
+                Text("Cancel build", fontSize = 13.sp)
+            }
+        }
+
+        // ── ERROR + RETRY (failed state) ──────────────────────────────────────
+        AnimatedVisibility(screen == Screen.Failed && error.isNotEmpty()) {
+            Text(error, color = Danger, fontSize = 12.sp,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Danger.copy(.08f), RoundedCornerShape(10.dp))
+                    .padding(10.dp))
+        }
         AnimatedVisibility(screen == Screen.Failed) {
             Button(
                 onClick  = ::reset,
